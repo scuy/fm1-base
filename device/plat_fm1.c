@@ -312,6 +312,12 @@ int16_t *plat_usb_ch(uint32_t off, uint32_t *run) { return uac_ch_frame(off, run
 #else
 int16_t *plat_usb_ch(uint32_t off, uint32_t *run) { (void)off; *run = 0; return 0; }
 #endif
+#if FELUCCA_UAC
+/* usb.c's own counter, in this translation unit after it: a render's block the capture ring had no room for */
+uint32_t plat_usb_audio_overruns(void) { return uac.overruns; }
+#else
+uint32_t plat_usb_audio_overruns(void) { return 0; }
+#endif
 void plat_yield(void)
 {
     ble_poll();                                   /* Bluetooth: its notifications go out while the screen draws */

@@ -1358,6 +1358,8 @@ static void usb_ch_master(const int32_t *blk)       /* the master into 1 and 2, 
 #else
 int16_t *plat_usb_ch(uint32_t off, uint32_t *run) { (void)off; *run = 0; return 0; }
 #endif
+/* the simulator records nothing, so the capture never drops a block */
+uint32_t plat_usb_audio_overruns(void) { return 0; }
 
 /* flash: one buffer per object, kept across a simulated reboot */
 static uint8_t store[OBJ_NOBJ][PLAT_STORE_MAX];

@@ -470,6 +470,11 @@ void plat_usb_play_gain(uint32_t q12);
 #define PLAT_USB_CH (FM1B_UAC_CH - 2)
 #define PLAT_USB_CH_STRIDE FM1B_UAC_CH
 int16_t *plat_usb_ch(uint32_t off, uint32_t *run);
+/* the USB audio input's dropped blocks since boot (usb_audio_in, FELUCCA_UAC): the capture ring was full when the
+ * render tapped it, so that block was not recorded (bsp/chip/usb.c uac.overruns). 0 with the capture off, and on
+ * the host. An app reads it into its own telemetry, so a take is judged on the device's count and not its length
+ * (moden-tji) */
+uint32_t plat_usb_audio_overruns(void);
 
 /* the keys' velocity and pressure (an app with APP_KEY_SENSE): on, the scan reads the keys on the analog rows and
  * hands each reading to the app (app_key_sample, app_key_probe); off by default */
