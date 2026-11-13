@@ -364,8 +364,8 @@ export class Updater {
     for (;;) {
       const pkt = await link.read(1000);
       if (!pkt) {
-        if (link.lost) return { served, finished: false, lost: true };
-        if (Date.now() - last > idleMs) return { served, finished: false };
+        if (link.lost) return { served, finished: false, lost: true, rc: null };
+        if (Date.now() - last > idleMs) return { served, finished: false, rc: null };
         continue;
       }
       const r = parseRequest(pkt);
@@ -378,6 +378,10 @@ export class Updater {
         continue;
       }
       last = Date.now();
+      if (r.addr === 0xF0000001) {
+        // the loader's own status when a session fails (loader.c): its return code in the length
+        return { served, finished: false, lost: false, rc: r.len };
+      }
       if (r.addr === 0xE0000000 || r.addr === 0xF0000000) {
         link.send(response(r.addr, [...new TextEncoder().encode("success"), 0]));
         if (r.addr === finishAddr) return { served, finished: true };
@@ -426,7 +430,10 @@ export class Updater {
     const ota = await this.waitFor(IS_OTA, 30000);
     if (!ota) throw fail("noloader", "the update loader did not appear. Replug the USB cable and press Install again: the device stays in update mode until it is finished.");
     const s2 = await this.write(ota, image, step);
-    if (!s2.finished) throw fail(s2.lost ? "lost" : "stopped", `the loader ${s2.lost ? "was disconnected" : "stopped"} after ${s2.served} requests. Replug and press Install again to resume.`);
+    if (!s2.finished) {
+      if (s2.rc != null) throw fail("stopped", `the loader reported its own status 0x${s2.rc.toString(16).padStart(6, "0")} after ${s2.served} requests (its sector check failed or a read did not arrive intact). Replug and press Install again to resume.`);
+      throw fail(s2.lost ? "lost" : "stopped", `the loader ${s2.lost ? "was disconnected" : "stopped"} after ${s2.served} requests. Replug and press Install again to resume.`);
+    }
     step("reboot");
     await sleep(3000);
     const back = await this.waitFor((id) => !IS_OTA(id), 40000);

@@ -52,6 +52,7 @@ HS_QUERY = bytes([0xF0, 0x00, 0x32, 0x45, 0x00, 0x00, 0x00, 0x40, 0x7F, 0xF7])
 HS_FULL = bytes([0xF0, 0x00, 0x32, 0x45, 0x08, 0x00, 0x00, 0x40, 0x00, 0x7E, 0x01, 0xF7])
 UPGRADE = bytes([0xF0, 0x22, 0x24, 0x35, 0x7F, 0xF7])
 FINISH_CHECK, FINISH_WRITE = 0xE0000000, 0xF0000000
+LOADER_STATUS = 0xF0000001      # the loader's own return code when a session fails (felucca-bsp loader.c)
 MAXDATA = 512
 # the fast install (loader/ldr_core.c): the hello and the loader's answer (cmd 0x31 [version 1, read size 16-bit LE]),
 # the loader's progress (cmd 0x32 [sectors compared, all sectors: 16-bit LE each]), its reads of one 4 KiB sector and
@@ -420,7 +421,8 @@ class Updater:
         return None
 
     def serve(self, link, image, finish, idle, progress, loader=False, fast=False, checked=None):
-        """answer read requests until the device asks for `finish`; -> (served, finished, lost).
+        """answer read requests until the device asks for `finish`; -> (served, finished, lost, rc), rc the loader's
+        own status when it reports a failed session (a read of LOADER_STATUS, the code in its length), else None.
         The loader (loader=True) may also ask 4 KiB reads and the sector table (the fast install: one it said yes to,
         fast=True, or a fast session it kept from before: the hello went unheard then) and say how far it compared
         (cmd 0x32 -> checked(k, n))"""
@@ -429,9 +431,9 @@ class Updater:
             pkt = link.read(DELAY["poll"])
             if pkt is None:
                 if link.lost:
-                    return served, False, True
+                    return served, False, True, None
                 if time.monotonic() - last > idle:
-                    return served, False, False
+                    return served, False, False, None
                 continue
             r = parse_request(pkt)
             if not r:
@@ -442,10 +444,12 @@ class Updater:
                 continue
             fl, addr, n = r
             last = time.monotonic()
+            if addr == LOADER_STATUS:
+                return served, False, False, n
             if addr in (FINISH_CHECK, FINISH_WRITE):
                 link.send(response(addr, b"success\0"))
                 if addr == finish:
-                    return served, True, False
+                    return served, True, False, None
                 continue
             if loader and TABLE <= addr < TABLE_END:
                 off, k = addr - TABLE, n // 6
@@ -460,7 +464,7 @@ class Updater:
             if not fast:
                 time.sleep(DELAY["reply"])
             if not link.send(response(addr, data, fl)):
-                return served, False, True
+                return served, False, True, None
             served += 1
             progress(served, addr, n)
 
@@ -469,10 +473,14 @@ class Updater:
         step("start", dev.id.text)
         dev.link.send(UPGRADE)
         time.sleep(DELAY["start"])
-        served, finished, lost = self.serve(dev.link, image, FINISH_CHECK, DELAY["idle_check"],
-                                            lambda k, addr, n: step("check", k))
+        served, finished, lost, rc = self.serve(dev.link, image, FINISH_CHECK, DELAY["idle_check"],
+                                                lambda k, addr, n: step("check", k))
         dev.link.close()
         if not finished:
+            if rc is not None:
+                raise InstallError("stopped",
+                                   f"the FM-1's loader reported its own status 0x{rc:06x} after {served} "
+                                   "requests; nothing was written")
             raise InstallError("lost" if lost else "stopped",
                                f"the FM-1 {'was disconnected' if lost else 'stopped answering'} after "
                                f"{served} requests; nothing was written")
@@ -528,10 +536,15 @@ class Updater:
 
         ota.link.send(UPGRADE)
         time.sleep(DELAY["start_fast" if fast else "start"])
-        served, finished, lost = self.serve(ota.link, image, FINISH_WRITE, DELAY["idle_write"], read,
-                                            loader=True, fast=fast, checked=checked)
+        served, finished, lost, rc = self.serve(ota.link, image, FINISH_WRITE, DELAY["idle_write"], read,
+                                                loader=True, fast=fast, checked=checked)
         ota.link.close()
         if not finished:
+            if rc is not None:
+                raise InstallError("stopped",
+                                   f"the loader reported its own status 0x{rc:06x} after {served} requests "
+                                   "(its sector check failed or a read did not arrive intact). Replug the "
+                                   "USB cable and run the install again to finish")
             raise InstallError("lost" if lost else "stopped",
                                f"the loader {'was disconnected' if lost else 'stopped answering'} after "
                                f"{served} requests. Replug the USB cable and run the install again to finish")
