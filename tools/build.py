@@ -1115,10 +1115,11 @@ def memory_regions(script):
 
 
 def mul64_near_loads(dis, window=4):
-    """functions with a load in flight beside a 32x32->64-bit multiply (rN_rM = rA * rB): one up to two instructions
-    before it, or one after it before its product is used (using it waits for the multiply). On the FM-1 such code
-    now and then leaves a register a bit off, most of all beside 16-bit loads (felucca-bsp docs/CPU.md); a
-    multiply in a helper of its own (noinline) is clear of it"""
+    """functions with a half-word (16-bit) load in flight beside a 32x32->64-bit multiply (rN_rM = rA * rB): one up
+    to two instructions before it, or one after it before its product is used (using it waits for the multiply). On
+    the FM-1 that shape now and then leaves a register a bit off: felucca-bsp docs/CPU.md's rule is int32-only data
+    beside the inlined product, and the 16-bit load is the one it is about — byte, word and doubleword loads beside
+    the product are not. A multiply in a helper of its own (noinline) is clear of it"""
     # vsnprintf (ble/wifi): its 64-bit digits are a divide and a multiply a few times a log line, not a hot loop
     found, fn, body, skip = [], "", [], set(CONF.get("mul64_check_skip", [])) | {"vsnprintf"}
 
@@ -1129,12 +1130,12 @@ def mul64_near_loads(dis, window=4):
                 continue
             dst = {m.group(1), m.group(2)}
             before = [b for b in body[max(0, i - 2):i] if not re.search(r"\bcall\b", b)]
-            if any(re.search(r"= [hbd]?\[", b) for b in before):
+            if any(re.search(r"= h\[", b) for b in before):
                 return True
             for b in body[i + 1:i + 1 + window]:
                 if any(re.search(r"\b" + r + r"\b", b) for r in dst):
                     break                       # the product used: the multiply has finished
-                if re.search(r"= [hbd]?\[", b):
+                if re.search(r"= h\[", b):
                     return True
         return False
 
