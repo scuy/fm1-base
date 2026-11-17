@@ -68,12 +68,13 @@ class FakeFM1:
     """a MIDI backend with one FM-1 on it"""
 
     def __init__(self, image, identity="FM-1_015", name="FM-1", unplug_after=None, after_write="FM-1_900",
-                 stall_after=None, bad_addr=None, refuse_arm=False, new_ota=(), jedec=0):
+                 stall_after=None, bad_addr=None, refuse_arm=False, new_ota=(), jedec=0, running_build=None):
         self.image, self.unplug_after, self.after_write = image, unplug_after, after_write
         self.new_ota, self.jedec = set(new_ota), jedec   # identities whose ota.c cuts the plain answer; bsp#29's bytes
         self.refuse_arm, self.armed, self.arms = refuse_arm, False, []
         self.stall_after, self.bad_addr = stall_after, bad_addr
         self.served = self.bad = self.upgrades = self.hs_full = 0
+        self.running_build, self.answers_build = running_build, True
         self.sent, self.links, self.gen, self.lock = [], [], 0, threading.Lock()
         self.boot(identity, name)
 
@@ -117,6 +118,11 @@ class FakeFM1:
             self.hs_full += 1
             if new:
                 self.ident(self.identity)
+        elif d == I.BUILD_QUERY:                # moden-nzvw: the app's own id, from the image it "runs"
+            b = self.running_build if self.running_build is not None else I.expected_build(self.image)
+            if b is not None and self.answers_build:
+                self.tx(bytes([0xF0, 0x7D, 0x4D, 0x4F, 0x44, 0x0F])
+                        + bytes((b >> (7 * i)) & 0x7F for i in range(5)) + b"\xF7")
         elif d == I.UPGRADE:
             if self.identity.startswith("FM1_") and not self.armed:
                 return                          # Open ignores an update it was not armed for
@@ -177,6 +183,21 @@ def package(product="FM-1_900", marker=True, size=0x2000):
 
 
 TMP = Path(tempfile.mkdtemp(prefix="felucca-install-"))
+
+BUILD = 0x5c8e1234
+
+
+def stamped(raw=None, build=BUILD):
+    """the package with the build tag at 0x3F00 of its flash image, where fm1pkg_make.flash_image writes it (the
+    image is the package without its 20 marker bytes, so the tag sits at 0x3F00 + 20 in the package)"""
+    if raw is None:
+        raw = package(size=0x4000)
+    raw = bytearray(raw)
+    tag = b"MODENBUILD:%08x" % build
+    at = 0x3F00 + I.BLOCKS
+    assert len(raw) >= at + len(tag), "the fixture image is too short for the tag"
+    raw[at:at + len(tag)] = tag
+    return bytes(raw)
 
 
 def pkgfile(name, raw):
@@ -279,6 +300,45 @@ def installs():
     dev = FakeFM1(image, identity="FM-1_600", name="FM-1", new_ota={"FM-1_600"})
     rc, out, err = cli(["--info"], dev)
     ok(rc == 0 and "flash:" not in out, "--info: no flash ID sent (bytes 24..26 zero): nothing said")
+
+
+def build_stamp():
+    """moden-nzvw: the package's tag, the app's answer after the restart, and the mismatch that a stale flash is"""
+    raw = stamped()
+    image = I.logical_image(raw)
+    p = pkgfile("stamped.fwsc", raw)
+    ok(I.expected_build(image) == BUILD and I.expected_build(I.logical_image(package())) is None,
+       "expected_build: the tag in the image, None for a package from before it")
+
+    dev = FakeFM1(image)
+    rc, out, err = cli([p, "--yes"], dev)
+    ok(rc == 0 and dev.bad == 0 and f"build {BUILD:08x}" in out and "done: the FM-1 runs FM-1_900" in out,
+       "install: the app answers the package's build id -> done, both ids printed")
+
+    dev = FakeFM1(image, running_build=0x0badf00d)
+    rc, out, err = cli([p, "--yes"], dev)
+    ok(rc == 6 and "done:" not in out and dev.bad == 0
+       and "came back on build 0badf00d" in err and f"the package is {BUILD:08x}" in err
+       and "the flash did not take" in err,
+       "install: the FM-1 comes back on another build -> exit 6, both ids, no done")
+
+    dev = FakeFM1(image)
+    dev.answers_build = False
+    rc, out, err = cli([p, "--yes"], dev)
+    ok(rc == 6 and "no build id" in err and "the flash did not take" in err and "done:" not in out,
+       "install: a tagged package, no answer (an older image cannot) -> exit 6")
+
+    dev = FakeFM1(I.logical_image(package()))
+    rc, out, err = cli([pkgfile("untagged.fwsc", package()), "--yes"], dev)
+    ok(rc == 0 and "no build tag" in out and "done: the FM-1 runs FM-1_900" in out,
+       "install: a package from before the stamp -> done with the note, no check")
+
+    dev = FakeFM1(image, identity="FM-1_905", name="Felucca")
+    rc, out, err = cli(["--info"], dev)
+    ok(rc == 0 and f"build {BUILD:08x}" in out and "running" in out, "--info: prints the running build id")
+    dev = FakeFM1(I.logical_image(package()), identity="FM-1_905", name="Felucca")
+    rc, out, err = cli(["--info"], dev)
+    ok(rc == 0 and "no answer" in out, "--info: an image from before the stamp says so")
 
 
 def errors():
@@ -387,6 +447,7 @@ def against_js():
 
 wire()
 installs()
+build_stamp()
 errors()
 from_open()
 against_js()

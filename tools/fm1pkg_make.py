@@ -10,6 +10,8 @@
              the head.
              app area 0x4000..: app_area_head, app.bin, the SDK cfg_tool.bin and
              eq_cfg_hw.bin, the region descriptors; SFC-encrypted with the chip key
+             with --build-id: "MODENBUILD:<8 hex>" in the head's padding at 0x3F00 (plain, past the SPL and
+             isd_config, before the app area; the loader never writes the head)
   ota.bin    the Felucca update loader (firmware/loader)
   res.bin    with --res: the app's resource region (device/res.c: its commit record, then the payload), padded to
              whole sectors, an entry of type 101 (as Melodee's) with the region's flash address at byte 0x14; the
@@ -109,7 +111,7 @@ def sdk_file(rel):
                      "checkout, or run tools/setup_toolchain.sh")
 
 
-def flash_image(app, key):
+def flash_image(app, key, stamp=None):
     spl = sdk_file("uboot.boot")                         # SDK SPL, BANKCB-encoded as in the SDK
     cfg_tool = sdk_file("cfg_tool.bin")
     eq = sdk_file("cfg/eq_cfg_hw.bin")
@@ -119,6 +121,9 @@ def flash_image(app, key):
     spl_off = 0xA0
     isd_off = spl_off + len(spl)
     assert isd_off + len(isd) <= 0x4000
+    if stamp is not None:                                # the app's build id, plain in the head's padding at 0x3F00
+        assert isd_off + len(isd) <= 0x3F00              # (past the SPL and isd_config, before the app area; ota.c's
+        f[0x3F00:0x3F13] = b"MODENBUILD:%08x" % stamp    # boot-area check reads neither), for fm1_install.py to scan
     # the SPL as an FM-1's flash holds it: its 16-byte container header ENC 0xFFFF, the rest ENC 0xFFFF again (the
     # entry's CRC stays the plain file's); felucca-bsp chip/ota.c refuses a writer whose boot area is not so
     spl_enc = bytearray(spl)
@@ -220,13 +225,16 @@ def main():
     ap.add_argument("--key", type=lambda s: int(s, 0), default=KEY)
     ap.add_argument("--sdk", type=Path, help="JieLi AC79 SDK checkout (default: $AC79_SDK)")
     ap.add_argument("--res", type=Path, help="the app's resource region (build/NAME-res.bin), for the loader to write")
+    ap.add_argument("--build-id", type=lambda s: int(s, 16),
+                    help="the app's build id, written into the flash image's padding at 0x3F00 as "
+                         "\"MODENBUILD:<8 hex>\" (the installer checks the running app against it)")
     ap.add_argument("--res-base", type=lambda s: int(s, 0), default=0, help="its flash address (app.h APP_RES_BASE)")
     a = ap.parse_args()
     global SDK
     SDK = a.sdk
     if a.res and not a.res_base:
         ap.error("--res needs --res-base (app.h APP_RES_BASE)")
-    pkg = ufw(flash_image(a.app.read_bytes(), a.key), a.ota.read_bytes(), a.product,
+    pkg = ufw(flash_image(a.app.read_bytes(), a.key, a.build_id), a.ota.read_bytes(), a.product,
               a.res.read_bytes() if a.res else None, a.res_base)
     a.out.write_bytes(pkg)
     print(f"package {a.out}: {len(pkg)} B, identity {a.product}, chip key {a.key:#06x}")

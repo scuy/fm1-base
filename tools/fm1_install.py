@@ -8,7 +8,11 @@ The same update as the web installer (web/fm1ota.js): step 1, the
 running firmware reads parts of the package and starts the update loader;
 step 2, the loader reads the whole package and writes it. In both steps the
 device asks (SysEx read requests on the logical image) and we answer. Then
-the FM-1 restarts and the installed identity is checked.
+the FM-1 restarts, its identity is checked, and — when the package carries a
+build tag ("MODENBUILD:<id>", written into the image by fm1pkg_make from
+build.py's build_id()) — the app is asked for its own build id
+(F0 7D 'M' 'O' 'D' 0F): a flash that did not take came back on another build
+and fails instead of printing done. `--info` prints it too.
 
 Step 2 is the fast install when the loader can (felucca-bsp loader/ldr_core.c,
 LDR_FAST_CHUNK): before the upgrade command we say cmd 0x31 [1, 4096]; a
@@ -29,7 +33,8 @@ fm1-base firmware gives (tools/fm1ports.py). Needs mido with python-rtmidi.
 
 Exit codes: 0 done, 1 cancelled or other error, 2 bad arguments or package,
 3 FM-1 not found, 4 connection lost or the device stopped, 5 timeout (no
-loader / no restart), 6 wrong model, or another identity after the install.
+loader / no restart), 6 wrong model, or another identity or build after the
+install.
 """
 import argparse
 import binascii
@@ -62,6 +67,8 @@ FAST_CHUNK = 4096
 TABLE, TABLE_END = 0xD0000000, 0xE0000000
 BLOCKS, BLK, KEEP = 20, 0x30, 0x2F
 LOADER_MARK = b"FELUCCA-LOADER-1"
+BUILD_TAG = b"MODENBUILD:"      # moden-nzvw: "MODENBUILD:<8 hex>" in the image, the same number the app answers
+BUILD_QUERY = bytes([0xF0, 0x7D, 0x4D, 0x4F, 0x44, 0x0F, 0x00, 0xF7])   # F0 7D 'M' 'O' 'D' 0F 00 F7
 
 # seconds; the tests shorten them
 DELAY = {"open": 0.3, "start": 2.0, "start_fast": 0.05, "fast_hello": 0.5, "reply": 0.01, "loader": 3.0, "reboot": 3.0,
@@ -187,6 +194,18 @@ def logical_image(raw):
 
 def model_of(text):
     return text.split("_")[0].removeprefix("ota-")
+
+
+def expected_build(image):
+    """the build id the package's image carries ("MODENBUILD:<8 hex>", fm1pkg_make's stamp at flash 0x3F00), or
+    None for a package from before the stamp: the check is then skipped, not failed"""
+    at = image.find(BUILD_TAG)
+    if at < 0:
+        return None
+    try:
+        return int(image[at + len(BUILD_TAG):at + len(BUILD_TAG) + 8], 16)
+    except ValueError:
+        return None
 
 
 # ------------------------------------------------------------------ MIDI ---
@@ -350,6 +369,23 @@ def handshake(link, tries=3):
             return ident
         full = ask(link, HS_FULL, DELAY["hs_full"])
         return full if full and full.model == ident.model and full.text.startswith(ident.text) else ident
+    return None
+
+
+def running_build(link):
+    """moden-nzvw: the app's own answer to F0 7D 'M' 'O' 'D' 0F: a plain frame, F0 7D M O D 0F b0..b4 F7, the id
+    in five 7-bit groups low first; -> the int, or None if the app does not answer (an older image cannot)"""
+    link.drain()
+    if not link.send(BUILD_QUERY):
+        return None
+    end = time.monotonic() + DELAY["hs"]
+    while (left := end - time.monotonic()) > 0:
+        p = link.read(left)
+        if p is None:
+            break
+        if (len(p) == 12 and p[0] == 0xF0 and p[-1] == 0xF7
+                and p[1:6] == bytes([0x7D, 0x4D, 0x4F, 0x44, 0x0F])):
+            return sum((p[6 + i] & 0x7F) << (7 * i) for i in range(5))
     return None
 
 
@@ -550,12 +586,13 @@ class Updater:
                                f"{served} requests. Replug the USB cable and run the install again to finish")
         step("write", 100)
 
-    def verify(self, product, step):
+    def verify(self, product, build, step):
         step("reboot")
         time.sleep(DELAY["reboot"])
         back = self.wait_for(lambda i: not i.loader, DELAY["wait_reboot"])
         if not back:
             raise InstallError("noreturn", "the FM-1 did not come back: power-cycle it")
+        running = running_build(back.link) if build is not None else None    # before the link closes
         back.link.close()
         for _ in range(3):                              # (the short answer, NAME_ddd, while the firmware still starts: it
             if back.id.text == product or not (re.fullmatch(r"[^_]+_\d{3}", back.id.text) and   # tells its whole one
@@ -569,7 +606,11 @@ class Updater:
             back = again
         if back.id.text != product and not (re.fullmatch(r"[^_]+_\d{3}", back.id.text) and product.startswith(back.id.text)):
             raise InstallError("mismatch", f"written, but the FM-1 reports {back.id.text} (expected {product})")
-        step("done", back.id.text)
+        if build is not None and running != build:   # moden-nzvw: the identity is static; the build is not
+            came = f"build {running:08x}" if running is not None else "no build id (the image cannot answer)"
+            raise InstallError("mismatch", f"the FM-1 came back on {came}, the package is {build:08x} — "
+                                           "the flash did not take")
+        step("done", back.id.text + (f", build {build:08x}" if build is not None else ""))
         return back.id.text
 
     def arm(self, dev, image, product, digest):
@@ -589,7 +630,7 @@ class Updater:
             raise InstallError("stopped", f"{dev.id.text} refused the package ({ack.hex() if ack else 'no reply'}); "
                                           "nothing was written")
 
-    def install(self, dev, image, product, step=lambda *a: None, digest=None, classic=False):
+    def install(self, dev, image, product, step=lambda *a: None, digest=None, classic=False, build=None):
         """running firmware -> loader -> new firmware; dev from find(). A device already in
         update mode only needs the write."""
         if model_of(dev.id.text) != model_of(product) and not dev.id.open:
@@ -599,7 +640,7 @@ class Updater:
             self.arm(dev, image, product, digest)
         ota = dev if dev.id.loader else self.check(dev, image, step)
         self.write(ota, image, step, classic)
-        return self.verify(product, step)
+        return self.verify(product, build, step)
 
 
 # ------------------------------------------------------------------- CLI ---
@@ -661,13 +702,20 @@ def run(a, backend, out, ask):
         dev = up.find()
         if not dev:
             raise not_found(up)
-        dev.link.close()
-        mode = "update loader (update not finished)" if dev.id.loader else "running"
         flash = f"  flash: {FLASH_PARTS.get(dev.id.flash, 'unknown')} ({dev.id.flash:06X})" if dev.id.flash else ""
-        print(f"{dev.id.text}  [{mode}]  port: {dev.name}{flash}", file=out)
+        if dev.id.loader:
+            print(f"{dev.id.text}  [update loader (update not finished)]  port: {dev.name}{flash}", file=out)
+        else:
+            b = running_build(dev.link)            # the running image's own id, not the static identity
+            shown = f"build {b:08x}" if b is not None else "build (no answer: an image from before the stamp)"
+            print(f"{dev.id.text}  [running]  {shown}  port: {dev.name}{flash}", file=out)
+        dev.link.close()
         return 0
     product, image, digest = load_package(a.package, a.force)
+    build = expected_build(image)
     print(f"package: {product}  ({a.package})", file=out)
+    if build is None:
+        print("note: the package carries no build tag, so the running build is not checked", file=out)
     dev = up.find()
     if not dev:
         raise not_found(up)
@@ -681,7 +729,7 @@ def run(a, backend, out, ask):
     try:
         # the fast install's hello only to a loader of this family (the package's: its marker); M-VAVE's loader,
         # which its own firmware brings, never hears it
-        up.install(dev, image, product, prog, digest, a.classic or LOADER_MARK not in image)
+        up.install(dev, image, product, prog, digest, a.classic or LOADER_MARK not in image, build)
     finally:
         prog.end()
     res = a.resources or os.path.join(os.path.dirname(a.package), os.path.basename(a.package).rsplit(".", 1)[0] + "-res.bin")
