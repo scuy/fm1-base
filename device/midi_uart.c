@@ -9,19 +9,26 @@
  * FELUCCA_MIDI_STAMP (usb.c): each message's landing time in midi_in_t24. uart_midi_peek(t), from the same fast tick as
  * usb_midi_peek (10 kHz, the ticks inside the render too), looks for bytes the DMA has written since: the slots the
  * parser has taken hold UM_MARK, so a slot that does not is a byte come in since the last peek, at about t (bytes found
- * together are spread back a byte time each, 0.32 ms at 31250 baud). A message takes its last byte's time. The take
- * still goes by the DMA's count; a byte it takes that no peek saw gets the last peek's t. */
+ * together are spread back a byte time each, 0.32 ms at 31250 baud). A message takes its last byte's time; a byte the
+ * take finds that no peek saw gets the last peek's t.
+ *
+ * The ring is read by content, not by the DMA count: every slot the parser has not been given holds UM_EMPTY,
+ * and the reader takes bytes until it meets two in a row. HRXCNT (latched at an event) can miss a byte while the
+ * byte itself is in the ring; the reader would then stay one byte behind, so a message would end only with the
+ * next byte (a note-off held until the next note). Following the content cannot drift. (Felucca [Salt]
+ * 0.9-salt14, ChanceTheMaker; found by keremimo on an FM-1 with an Akai MPC Sample; GPL-3.0.) */
 #include "fm1_uart.h"           /* registers (felucca-bsp chip/; the host test adds it to its include path) */
 
 #define UM_RING 128u
+#define UM_EMPTY 0xFDu         /* an undefined real-time byte, never sent: a slot the parser has taken, or never had */
 static volatile uint8_t um_ring[UM_RING] __attribute__((aligned(16)));
 static struct {
-    uint32_t rd, pend;
+    uint32_t rd;
     uint32_t bytes, drops, msgs;
     uint8_t st, need, got, d0, sysex;
 } um;
 #if FELUCCA_MIDI_STAMP
-#define UM_MARK 0xFDu           /* an undefined real-time byte, never sent: a slot the parser has taken */
+#define UM_MARK UM_EMPTY        /* (the peek looks for the slots the reader has not emptied) */
 #define UM_TQ 32u               /* the bytes stamped ahead of the parser (10 ms of a full line; older: the peek's t) */
 #define UM_BYTE_T (320u * FM1_TICKS_PER_US)   /* a byte at 31250 baud (10 bits) */
 static uint32_t um_t[UM_TQ];    /* byte n's landing time (n counted as um.bytes) at n % UM_TQ */
@@ -44,11 +51,9 @@ static int um_put(uint32_t pkt)                    /* into midi_in_q (usb.c): 0 
 
 static void uart_midi_init(void)                   /* before TIMER5 starts: PORTH read-modify-write */
 {
-#if FELUCCA_MIDI_STAMP
     uint32_t i;
     for (i = 0; i < UM_RING; i++)
-        um_ring[i] = UM_MARK;
-#endif
+        um_ring[i] = UM_EMPTY;
     fm1_uart1_midi_init(um_ring, UM_RING);
 }
 
@@ -108,32 +113,32 @@ static void um_byte(uint32_t b)
     }
 }
 
-static void uart_midi_take(uint32_t n)
+/* the bytes the DMA has written since the last call; a received UM_EMPTY (line noise) is passed over once the byte
+ * after it has landed */
+static void uart_midi_take(void)
 {
-    um.pend += n;
-    if (um.pend > UM_RING) {                       /* the DMA lapped us: wait for a whole new status */
-        um.drops += um.pend - UM_RING;
-        um.rd = (um.rd + um.pend - UM_RING) & (UM_RING - 1u);
-        um.pend = UM_RING;
-        um.st = um.got = um.sysex = 0;
-#if FELUCCA_MIDI_STAMP
-        um_ahead = 0;                              /* (the stamps were for the bytes overwritten) */
-#endif
-    }
-    while (um.pend) {
+    uint32_t n;
+    for (n = 0; n < UM_RING; n++) {
+        uint32_t b = um_ring[um.rd];
+        if (b == UM_EMPTY) {
+            if (um_ring[(um.rd + 1u) & (UM_RING - 1u)] == UM_EMPTY)
+                break;
+            b = um_ring[um.rd];                    /* the DMA writes in order: this one has landed too */
+        }
+        um_ring[um.rd] = UM_EMPTY;
 #if FELUCCA_MIDI_STAMP
         um_now = um_ahead && um_ahead <= UM_TQ ? um_t[um.bytes % UM_TQ] : um_peek_t;
         if (um_ahead)
             um_ahead--;
-        um_byte(um_ring[um.rd]);
-        um_ring[um.rd] = UM_MARK;
-#else
-        um_byte(um_ring[um.rd]);
 #endif
         um.rd = (um.rd + 1u) & (UM_RING - 1u);
-        um.pend--;
         um.bytes++;
+        um_byte(b);                                /* a UM_EMPTY is an unknown realtime byte: ignored */
     }
 }
 
-static void uart_midi_poll(void) { uart_midi_take(fm1_uart1_rx_take()); }   /* TIMER5, outside the render */
+static void uart_midi_poll(void)                   /* TIMER5, outside the render */
+{
+    fm1_uart1_rx_take();                           /* acknowledges the pendings; the count is not used */
+    uart_midi_take();
+}

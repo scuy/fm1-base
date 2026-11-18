@@ -13,10 +13,10 @@
 static int fails;
 static void feed(const uint8_t *b, uint32_t n)
 {
-    uint32_t i, w = (um.rd + um.pend) & (UM_RING - 1u);
+    uint32_t i, w = um.rd;
     for (i = 0; i < n; i++)
         um_ring[(w + i) & (UM_RING - 1u)] = b[i];
-    uart_midi_take(n);
+    uart_midi_take();                                   /* the drain reads by content, not by count */
 }
 static void want(const char *what, const uint32_t *pk, uint32_t n)
 {
@@ -38,6 +38,11 @@ static void want(const char *what, const uint32_t *pk, uint32_t n)
 
 int main(void)
 {
+    {   /* the DMA's slots start unwritten (UM_EMPTY), as uart_midi_init leaves them */
+        uint32_t i;
+        for (i = 0; i < UM_RING; i++)
+            um_ring[i] = UM_EMPTY;
+    }
     {   /* a note on, then two more by running status, a clock in the middle of one */
         static const uint8_t b[] = {0x91, 60, 100, 62, 0xF8, 90, 64, 0};
         static const uint32_t p[] = {PK(0x91, 60, 100), RT(0xF8), PK(0x91, 62, 90), PK(0x91, 64, 0)};
@@ -62,16 +67,22 @@ int main(void)
         feed(b, sizeof b);
         want("SysEx skipped, running status not resumed after it", p, 3);
     }
-    {   /* the DMA laps the reader: the half message left is dropped, the next status is clean */
+    {   /* the DMA laps the reader: the ring holds the last 128 bytes, and the reader follows the content. The
+         * last ten bytes land at the ring's start: a status, its data, then EOX (which clears running status) so
+         * the stale status before them cannot pair with the 0x30 pad */
         uint8_t b[UM_RING + 10];
         uint32_t i;
         static const uint32_t p[] = {PK(0xB0, 74, 99)};
         for (i = 0; i < sizeof b; i++)
             b[i] = 0x30;                                 /* data bytes with no status before them */
         b[0] = 0x90;
-        memcpy(b + sizeof b - 3, "\xB0\x4A\x63", 3);
+        b[UM_RING] = 0xB0;
+        b[UM_RING + 1] = 0x4A;
+        b[UM_RING + 2] = 0x63;
+        for (i = UM_RING + 3; i < sizeof b; i++)
+            b[i] = 0xF7;                                 /* system common: running status ends */
         feed(b, sizeof b);
-        want("overrun: resync on the next status", p, 1);
+        want("overrun: the ring's content, a status at the wrap", p, 1);
     }
     printf(fails ? "trs: %d FAILED\n" : "trs: ok\n", fails);
     return fails != 0;

@@ -178,7 +178,7 @@ static void run(int kind, uint32_t load, struct err *enew, struct err *epoll, st
         if (usb_due_m && !in_render) {
             usb_due_m = 0;
             usb_poll();
-            uart_midi_take(dma_cnt);
+            uart_midi_take();                       /* (by content: dma_cnt only counts) */
             dma_cnt = 0;
             if (!(regs[1][20] & 1u) && usb_waiting && usb_wait_t <= t)
                 usb_wait_t = t + 10u * US;              /* a held OUT lands at the host's next try */
@@ -252,7 +252,7 @@ int main(void)
         uint32_t w0 = mi_w;
         uart_midi_peek(7000u);
         trs_land(0xF8);
-        uart_midi_take(dma_cnt);
+        uart_midi_take();
         dma_cnt = 0;
         check(mi_w == w0 + 1u && midi_in_t24[w0 % MQ] == 7000u, "a byte no peek saw takes the last peek's time");
         /* two bytes found by one peek: the first a byte time back */
@@ -260,7 +260,7 @@ int main(void)
         trs_land(0x40);
         trs_land(0x64);
         uart_midi_peek(20000u);
-        uart_midi_take(dma_cnt);
+        uart_midi_take();
         dma_cnt = 0;
         check(mi_w == w0 + 2u && midi_in_t24[(w0 + 1u) % MQ] == 20000u, "a message found whole takes the peek's time");
         mi_r = mi_w;
