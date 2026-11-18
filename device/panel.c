@@ -3,7 +3,14 @@
  * Adapted from Felucca's panel.c, Copyright (C) 2026 Leo Kuroshita (@kurogedelic), Hugelton Instruments. */
 /* Physical panel: which matrix button / encoder carries which printed label (plat.h's
  * B_* / EN_*). HARDWARE CALIBRATION (hold OCT- and OCT+ while powering on) asks for each
- * label in turn; the table is kept in flash (OBJ_PANEL) and in .noinit. */
+ * label in turn; the table is kept in flash (OBJ_PANEL) and in .noinit.
+ *
+ * The direction is the unit's too (moden-l9vt): the encoders' quadrature phase follows the
+ * wiring, and the wiring differs between production batches — the first generation's SELECT
+ * encoder arrives opposite the other six, the newer batch's like them. plat_enc() applies
+ * dir, so the app's + detent is clockwise on every unit; the default below is the first
+ * generation's, and a unit of another batch is set once (hardware calibration, or main_fm1.c's
+ * remote op 5 / fm1_remote.py encdir, which keeps it in the same object). */
 static const char *const B_NAME[NB] = {"FX", "SEL", "ENV", "LFO", "EDIT", "GLO", "HOME", "SAVE",
                                         "ARP", "SEQ", "PLAY", "REC", "OCT-", "OCT+"};
 static const char *const E_NAME[NE] = {"SELECT", "ALGORITHM", "PRESETS", "KNOB 1", "KNOB 2",
@@ -22,7 +29,7 @@ static const panel_t PANEL_DEFAULT = {
     PANEL_MAGIC,
     {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 0, 1},
     {0, 1, 6, 2, 3, 4, 5},
-    {1, 1, 1, 1, 1, 1, 1},
+    {-1, 1, 1, 1, 1, 1, 1},              /* SELECT opposite (the first generation's wiring): EN_* order */
 };
 
 static int panel_valid(const panel_t *p)
@@ -42,6 +49,20 @@ static void panel_init(void)
         panel = p;
     if (!panel_valid(&panel))
         panel = PANEL_DEFAULT;
+}
+
+/* An encoder's direction, per role: +1 / -1, or dir 0 to read it where it stands. The hardware calibration teaches
+ * all of them; this one-role form is what the host uses (main_fm1.c's remote op 5, tools/fm1_remote.py encdir) for
+ * a unit whose batch wires one encoder the other way, and it keeps the value in the panel's own object. */
+static int panel_enc_dir(int role, int dir)
+{
+    if (role < 0 || role >= NE)
+        return 0;
+    if (dir == 1 || dir == -1) {
+        panel.dir[role] = (int8_t)dir;
+        plat_store_save(OBJ_PANEL, &panel, sizeof panel);
+    }
+    return panel.dir[role];
 }
 
 #define SETUP_IDLE_MS 30000u

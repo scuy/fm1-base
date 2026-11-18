@@ -871,6 +871,8 @@ static int log_frame(const uint8_t *p, uint32_t n)
  *   2 k0 k1 k2 k3    the keys held (bit k = key k, seven bits a byte, low first)
  *   3 role delta     an encoder turned (EN_*; delta - 64 detents)
  *   4 lo hi          MASTER's position (0..4096, seven bits a byte; 4097 or more: the pot's own again)
+ *   5 role dir       an encoder's direction (EN_*; 1 = +1, 0 = -1), kept in the panel's calibration
+ *   6 role           that encoder's direction in force, answered F0 7D 4C 44 role dir F7 (1 or 0)
  * Each is added to the panel's own input (plat_fm1.c remote); the answer is F0 7D 4C 43 op F7. */
 static int remote_frame(const uint8_t *p, uint32_t n)
 {
@@ -897,6 +899,21 @@ static int remote_frame(const uint8_t *p, uint32_t n)
             remote.master = v > 4096u ? -1 : (int32_t)v;
         }
         break;
+    case 5:                                  /* an encoder's direction (1 = +, 0 = -): kept with the panel's calibration */
+        if (n >= 6u && p[4] < NE && p[5] <= 1u)
+            panel_enc_dir(p[4], p[5] ? 1 : -1);
+        break;
+    case 6: {                                /* ... and its answer in force, which stands in for the ack */
+        static uint8_t r[7] = {0xF0, 0x7D, 0x4C, 0x44, 0, 0, 0xF7};
+        int d;
+        if (n < 5u || p[4] >= NE)
+            break;
+        r[4] = p[4];
+        d = panel_enc_dir(p[4], 0);
+        r[5] = (uint8_t)(d < 0 ? 0 : 1);
+        ota_wire_send(r, sizeof r);
+        return 1;
+    }
     default:
         return 1;
     }

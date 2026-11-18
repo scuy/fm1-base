@@ -10,6 +10,9 @@ or by a program (an agent). Needs mido with python-rtmidi.
     press BTN | release BTN | tap BTN       a button (FX SEL ENV LFO EDIT GLO HOME SAVE ARP SEQ PLAY REC OCT- OCT+)
     key K down | key K up | tapkey K        a key, 0..26 (0 = F3), as pressed (no velocity reading)
     turn ENC N                              an encoder, N detents (SELECT ALGO PRESET K1 K2 K3 K4)
+    encdir ENC [+|-]                        an encoder's direction: read it, or set it and read it back (+ = the
+                                            app's clockwise; kept in the unit's panel calibration, which a flash
+                                            leaves alone — production batches wire SELECT's phase differently)
     master N | master pot                   MASTER at 0..4096, or the pot's own again
     wait MS                                 let it run (with listen: print what it says meanwhile)
     listen                                  a screen reader starts listening: every message it says is printed
@@ -76,6 +79,7 @@ import fm1ports
 BTN = ["FX", "SEL", "ENV", "LFO", "EDIT", "GLO", "HOME", "SAVE", "ARP", "SEQ", "PLAY", "REC", "OCT-", "OCT+"]
 ENC = ["SELECT", "ALGO", "PRESET", "K1", "K2", "K3", "K4"]
 LC, LG, LW, SR = [0x7D, 0x4C, 0x43], [0x7D, 0x4C, 0x47], [0x7D, 0x4C, 0x57], [0x7D, 0x53, 0x52]
+LCQ = [0x7D, 0x4C, 0x44]        # an encoder's direction: F0 7D 4C 44 role dir F7 (dir 1 = +, 0 = -)
 WIFI_OP = {"on": 1, "off": 2, "scan": 3, "status": 4, "saved": 5, "forget": 6, "join": 7, "found": 8}
 ACK_TIMEOUT = 0.25      # s: the device acks from its main loop, a few ms behind the frame; 250 ms is ~250 passes
 ACK_TRIES = 4           # sends an op before giving up: a dead link fails in 1 s an op instead of hanging
@@ -340,6 +344,20 @@ class FM1:
                     self.lc([3, ENC.index(a.upper()), 64 + step])
                     n -= step
                 i += 3
+            elif c == "encdir":
+                role = ENC.index(a.upper())
+                d = {"+": 1, "+1": 1, "right": 1, "-": -1, "-1": -1, "left": -1}.get(b.lower())
+                if d is not None:
+                    self.lc([5, role, 1 if d > 0 else 0])
+                    i += 3
+                else:
+                    i += 2
+                self.frames(LCQ, 0)
+                self.sysex(LC + [6, role])
+                got = self.frames(LCQ, ACK_TIMEOUT, until=lambda f: f[:1] == bytes([role]))
+                if not got:
+                    raise SystemExit(f"no answer for encdir {a.upper()} (an older firmware?)")
+                print(f"encdir: {a.upper()} {'+' if got[-1][1] else '-'}")
             elif c == "master":
                 v = 4097 if a == "pot" else max(0, min(4096, int(a)))
                 self.lc([4, v & 0x7F, v >> 7])
