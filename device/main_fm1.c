@@ -1182,6 +1182,32 @@ static void enter_uboot(const char *why)
     fm1_enter_uboot();
 }
 
+#include "sx_pass.c"                               /* the frames received: the readers', then the updater's */
+
+static int safe_take(const uint8_t *p, uint32_t n)  /* safe mode's readers: the log readout's */
+{
+    return log_frame(p, n) || CL_REQUEST(p, n) || DS_REQUEST(p, n);
+}
+
+static int main_take(const uint8_t *p, uint32_t n)  /* the app's main loop: a screen reader's SysEx (announce.c), the
+                                                     * platform's, then the app's */
+{
+    return ann_frame(p, n, fm1_ms) || log_frame(p, n) || CL_REQUEST(p, n) || DS_REQUEST(p, n) || remote_frame(p, n)
+#if FM1B_WIFI
+           || wifi_frame(p, n)
+#endif
+#if FM1B_BT_AUDIO
+           || bta_frame(p, n)
+#endif
+#if FM1B_BLE_OWN && FM1B_BLE_CENTRAL
+           || dev_frame(p, n)
+#endif
+#ifdef APP_SYSEX
+           || app_sysex(p, n)
+#endif
+        ;
+}
+
 /* SAFE MODE: the app crashed (or hung) twice while starting. Nothing that makes sound runs: no audio,
  * no engine, no UI; USB is on, so the web installer (this firmware's, or the stock one) and M-UPGRADE can
  * reach it. PLAY tries the app again, REC the chip's own update mode (as at power-on); it stays the last resort too
@@ -1229,14 +1255,8 @@ static void safe_main(void)
             fm1_clock_restore();                            /* (a soft reset keeps the PLL: stock for what starts next) */
     fm1_reboot();
         }
-        {   /* the log readout works here too: what crashed is the question safe mode raises */
-            const uint8_t *p;
-            uint32_t n;
-            if (ota_frame_get(&p, &n) && (log_frame(p, n) || CL_REQUEST(p, n) || DS_REQUEST(p, n)))
-                ota_frame_done();
-            else
-                ota_service();                      /* (only at a frame the log didn't take) */
-        }
+        (void)sx_pass(safe_take);                   /* the log readout works here too: what crashed is the question
+                                                     * safe mode raises; the updater at a frame the log didn't take */
         if (usb.ota_req) {
             usb.ota_req = 0;
             if (flash_ok)
@@ -1272,7 +1292,6 @@ static void fm1_main(void)
     int32_t knob = 512 * 16;
     uint32_t batt_t = 0;                            /* (the battery's last reading, fm1_ms) */
     uint32_t last_frame = 0;
-    int took;                                       /* a SysEx frame taken this pass (not the updater's) */
     {
         uint32_t f = irq_save();
 #if FM1B_CRASHLOG
@@ -1456,34 +1475,11 @@ static void fm1_main(void)
 #ifdef APP_SYSEX
         plat_sysex_hold();                          /* (a stream the app left open: let go, so replies go out) */
 #endif
-        {   /* a screen reader's SysEx (announce.c), before the updater looks; the updater only at a frame none took
-             * (the next one waiting, else, would be its own, dropped if not) */
-            const uint8_t *p;
-            uint32_t n;
-            took = 0;
-            if (ota_frame_get(&p, &n) && (ann_frame(p, n, fm1_ms) || log_frame(p, n) || CL_REQUEST(p, n) ||
-                                          DS_REQUEST(p, n) || remote_frame(p, n)
-#if FM1B_WIFI
-                                          || wifi_frame(p, n)
-#endif
-#if FM1B_BT_AUDIO
-                                          || bta_frame(p, n)
-#endif
-#if FM1B_BLE_OWN && FM1B_BLE_CENTRAL
-                                          || dev_frame(p, n)
-#endif
-#ifdef APP_SYSEX
-                                          || app_sysex(p, n)
-#endif
-                                          )) {
-                ota_frame_done();
-                took = 1;
-            }
-        }
         fm1b_dbg.stage = 4;
-        if (!took)
-            usb_cmd(ota_service());                 /* M-UPGRADE handshake; the commands in its framing (backup,
-                                                     * mirror, the app's); other SysEx is dropped */
+        usb_cmd(sx_pass(main_take));                /* a screen reader's SysEx (announce.c), the platform's and the
+                                                     * app's; the updater (M-UPGRADE handshake, the commands in its
+                                                     * framing: backup, mirror, the app's) only at a frame none took;
+                                                     * other SysEx is dropped */
 #if FM1B_BACKUP
         bu_step();                                  /* a backup streaming to the host */
 #endif

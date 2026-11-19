@@ -89,6 +89,9 @@ run boot-pack sh tests/boot_pack_test.sh               # the boot's LZMA load im
 # the firmwares not on fm1-base): the protocol, the SAY frames, ann_later's settling
 run announce sh -c "$CC -std=c99 -Wall -Wextra -Werror -Wno-unused-function -o $OUT/announce_test tests/announce_test.c && \
     $OUT/announce_test"
+# the main loop's look at the SysEx frames received (device/sx_pass.c): a frame queued just after a look that found
+# none waits for the next pass, never the updater's (which dropped an app's query, moden-mz59)
+run sx-pass sh -c "$CC -std=c99 -Wall -Wextra -Werror -o $OUT/sx_pass_test tests/sx_pass_test.c && $OUT/sx_pass_test"
 # the half rendered aside (device/audio_commit.c) over a simulated audio DMA: copied only while its half is free
 run audio-commit sh -c "$CC -std=c99 -Wall -Wextra -Werror -O2 -Idevice -o $OUT/audio_commit_test \
     tests/audio_commit_test.c && $OUT/audio_commit_test"
