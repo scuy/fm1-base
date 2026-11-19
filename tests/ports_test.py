@@ -235,13 +235,29 @@ d.link.close()
 
 # ---------------------------------------------------------- fm1_remote.py ---
 
-dev = Dev("Arturia KeyStep", answer=fm1("Template 1.0"))
+def remote_answer(d, base=fm1("Template 1.0")):
+    if d[:3] == bytes([0x7D, 0x4C, 0x43]) and len(d) > 3:   # an LC op: acked as remote_frame does (F0 7D 4C 43 op F7)
+        return [d[:4]]
+    return base(d)
+
+
+dev = Dev("Arturia KeyStep", answer=remote_answer)
 sys.modules["mido"] = fake_mido([Dev("IAC Bus 1", answer=loopback), dev])
 import fm1_remote as R  # noqa: E402
 r = R.FM1()
 ok(r.name == "Arturia KeyStep", "fm1_remote: the FM-1 found by its HELLO answer")
 r.run(["tap", "REC"])
-ok(any(s[:3] == bytes([0x7D, 0x4C, 0x43]) for s in dev.sent), "  and driven")
+ok(sum(s[:4] == bytes([0x7D, 0x4C, 0x43, 1]) for s in dev.sent) == 2, "  and driven: a press and a release, each acked once")
+mute = Dev("Arturia KeyStep", answer=fm1("Template 1.0"))   # an FM-1 whose acks never come: resent, then a clear exit
+sys.modules["mido"] = fake_mido([mute])
+R.mido = sys.modules["mido"]
+R.ACK_TIMEOUT = 0.01
+try:
+    R.FM1().run(["press", "REC"])
+    ok(False, "fm1_remote: no ack, a clear exit")
+except SystemExit as e:
+    ok("no ack" in str(e) and sum(s[:4] == bytes([0x7D, 0x4C, 0x43, 1]) for s in mute.sent) == R.ACK_TRIES,
+       "fm1_remote: no ack, ACK_TRIES sends and a clear exit")
 sys.modules["mido"] = fake_mido([dev])
 R.mido = sys.modules["mido"]
 try:
