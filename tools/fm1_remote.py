@@ -43,6 +43,10 @@ The firmware's side: device/main_fm1.c remote_frame (F0 7D 4C 43 ...), log_frame
 (F0 7D 4C 57), the crash history (device/crashlog.c, F0 7D 4C 48: its frames documented above log_frame), and the
 screen reader's protocol (fm1-reader PROTOCOL.md: F0 7D 53 52).
 
+Every LC op is acked (F0 7D 4C 43 op F7), so each one is sent and its ack waited for, resent up to ACK_TRIES
+times at ACK_TIMEOUT each: a frame the receiver drops costs a retry instead of a button left held. sysex() still
+sends a raw frame, for experiments.
+
 The crash history's frames, for a program (parse_crash_frames reads them):
   F0 7D 4C 48 F7                  asks; the answer, one frame a record, the oldest first, F0 7D 4C 48 <ASCII> F7:
     crash I/N n COUNT vec HEX pc HEX rets HEX sp HEX ms DEC emu HEX dbg HEX psr HEX build HEX seq DEC
@@ -73,6 +77,8 @@ BTN = ["FX", "SEL", "ENV", "LFO", "EDIT", "GLO", "HOME", "SAVE", "ARP", "SEQ", "
 ENC = ["SELECT", "ALGO", "PRESET", "K1", "K2", "K3", "K4"]
 LC, LG, LW, SR = [0x7D, 0x4C, 0x43], [0x7D, 0x4C, 0x47], [0x7D, 0x4C, 0x57], [0x7D, 0x53, 0x52]
 WIFI_OP = {"on": 1, "off": 2, "scan": 3, "status": 4, "saved": 5, "forget": 6, "join": 7, "found": 8}
+ACK_TIMEOUT = 0.25      # s: the device acks from its main loop, a few ms behind the frame; 250 ms is ~250 passes
+ACK_TRIES = 4           # sends an op before giving up: a dead link fails in 1 s an op instead of hanging
 LA = [0x7D, 0x4C, 0x41]                    # Bluetooth audio (device/bt_own_audio.c bta_frame)
 BTA_OP = {"on": 1, "off": 2, "scan": 3, "status": 4, "found": 5, "pick": 6, "connect": 7, "known": 8, "hangup": 9,
           "forget": 10}
@@ -254,28 +260,49 @@ class FM1:
             raise SystemExit(f"fm1_remote: {e}")
         self.btn = self.keys = 0
         self.listening = False
+        self.said = []                       # the screen reader's words, not yet printed
         self.elf = ElfSymbols(elf) if elf else None
 
     def sysex(self, data):
         self.out.send(self.mido.Message("sysex", data=data))
 
     def frames(self, head, secs, until=None):
+        """Read the input for up to secs: the screen reader's words go to self.said (so an ack wait does not eat
+        them), and the frames whose head matches are returned, until() ending the wait early."""
         got, t = [], time.time()
-        while time.time() - t < secs:
+        while True:
             for m in self.inp.iter_pending():
-                if m.type == "sysex" and list(m.data[:3]) == head:
-                    got.append(bytes(m.data[3:]))
+                if m.type != "sysex":
+                    continue
+                d = list(m.data)
+                if d[:3] == SR and len(d) > 4 and d[3] == 16:
+                    self.said.append(bytes(d[5:]))       # 16 SAY flags, text
+                    continue
+                if d[:3] == head:
+                    got.append(bytes(d[3:]))
                     if until and until(got[-1]):
                         return got
+            if time.time() - t >= secs:
+                return got
             time.sleep(0.01)
-        return got
+
+    def lc(self, data):
+        """Send one LC op and wait for its ack (F0 7D 4C 43 op F7), resending up to ACK_TRIES times: a frame the
+        receiver drops costs one resend instead of a stuck button bit, and a dead link fails in 1 s an op."""
+        op = data[0]
+        self.frames(LC, 0)                   # a late ack of an earlier send of this op is not this one's
+        for n in range(ACK_TRIES):
+            self.sysex(LC + data)
+            if self.frames(LC, ACK_TIMEOUT, until=lambda f: f[:1] == bytes([op])):
+                return n
+        raise SystemExit(f"no ack for LC op {op} after {ACK_TRIES} sends")
 
     def buttons(self):
-        self.sysex(LC + [1, self.btn & 0x7F, (self.btn >> 7) & 0x7F])
+        self.lc([1, self.btn & 0x7F, (self.btn >> 7) & 0x7F])
 
     def keys_send(self):
         k = self.keys
-        self.sysex(LC + [2, k & 0x7F, (k >> 7) & 0x7F, (k >> 14) & 0x7F, (k >> 21) & 0x7F])
+        self.lc([2, k & 0x7F, (k >> 7) & 0x7F, (k >> 14) & 0x7F, (k >> 21) & 0x7F])
 
     def run(self, args):
         i = 0
@@ -293,13 +320,11 @@ class FM1:
                 if c != "press":
                     self.btn &= ~bit
                     self.buttons()
-                time.sleep(0.03)
                 i += 2
             elif c == "key":
                 bit = 1 << int(a)
                 self.keys = self.keys | bit if b == "down" else self.keys & ~bit
                 self.keys_send()
-                time.sleep(0.03)
                 i += 3
             elif c == "tapkey":
                 self.keys |= 1 << int(a)
@@ -307,26 +332,24 @@ class FM1:
                 time.sleep(0.1)
                 self.keys &= ~(1 << int(a))
                 self.keys_send()
-                time.sleep(0.03)
                 i += 2
             elif c == "turn":
                 n = int(b)
                 while n:
                     step = max(-63, min(63, n))
-                    self.sysex(LC + [3, ENC.index(a.upper()), 64 + step])
+                    self.lc([3, ENC.index(a.upper()), 64 + step])
                     n -= step
-                time.sleep(0.05)
                 i += 3
             elif c == "master":
                 v = 4097 if a == "pot" else max(0, min(4096, int(a)))
-                self.sysex(LC + [4, v & 0x7F, v >> 7])
-                time.sleep(0.05)
+                self.lc([4, v & 0x7F, v >> 7])
                 i += 2
             elif c == "wait":
                 if self.listening:
-                    for f in self.frames(SR, int(a) / 1000):
-                        if f and f[0] == 16:
-                            print("said:", f[2:].decode("latin1", "replace"))
+                    self.frames(SR, int(a) / 1000)
+                    for s in self.said:
+                        print("said:", s.decode("latin1", "replace"))
+                    self.said.clear()
                 else:
                     time.sleep(int(a) / 1000)
                 i += 2
@@ -337,12 +360,12 @@ class FM1:
             elif c == "screen":
                 self.sysex(SR + [1, 1])                  # HELLO, then where am I
                 time.sleep(0.2)
-                for m in self.inp.iter_pending():
-                    pass
+                self.frames(SR, 0)                       # drop what was pending
+                self.said.clear()
                 self.sysex(SR + [3])
-                for f in self.frames(SR, 1.0):
-                    if f and f[0] == 16:
-                        print("screen:", f[2:].decode("latin1", "replace"))
+                self.frames(SR, 1.0)
+                for s in self.said:
+                    print("screen:", s.decode("latin1", "replace"))
                 i += 1
             elif c == "log":
                 self.sysex(LG)
@@ -424,13 +447,10 @@ class FM1:
                         print("dev:", f[1:].decode("latin1", "replace"))
                 i += used
             elif c == "release-all":
-                self.btn = self.keys = 0           # a frame at a time: three back to back, the FM-1 may drop one
+                self.btn = self.keys = 0           # each op waits for its ack, so none is lost to a burst
                 self.buttons()
-                time.sleep(0.03)
                 self.keys_send()
-                time.sleep(0.03)
-                self.sysex(LC + [4, 4097 & 0x7F, 4097 >> 7])
-                time.sleep(0.03)
+                self.lc([4, 4097 & 0x7F, 4097 >> 7])
                 i += 1
             else:
                 raise SystemExit(f"unknown command {c!r}\n\n{__doc__}")
