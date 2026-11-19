@@ -307,6 +307,15 @@ static uint32_t min_q[MQ], mi_w, mi_r;
 static FILE *midi_log;
 static uint32_t midi_out_count, clock_out_count;
 static uint32_t min_port[MQ];
+static uint32_t min_t[MQ], min_t_last;          /* each packet's arrival: the simulated clock at its push (plat_midi_in_t24) */
+static void min_push(uint32_t pkt, uint32_t port)   /* the script's way in: stamped where it is queued */
+{
+    min_q[mi_w % MQ] = pkt;
+    min_port[mi_w % MQ] = port;
+    min_t[mi_w % MQ] = now_ms * (1000u * PLAT_TICKS_PER_US);   /* the script's ms on the device's 24 MHz count (it
+                                                                * wraps at 179 s as the device's does: differences only) */
+    mi_w++;
+}
 static uint32_t out_pkt[4096], out_to[4096], n_out;   /* what went out since the script's last "out" */
 static int ble_state, ble_conn, bdev_state;   /* bdev_state: the Bluetooth MIDI device (BLE_DEV_*) */
 static uint32_t midi_n[NPORTS][2], midi_t[NPORTS][2];   /* plat_midi_count */
@@ -441,8 +450,7 @@ static int usbh_cmd(const char *a, const char *b, const char *c, const char *d)
             printf("  usbh midi: no device connected that sends: dropped\n");
             return 0;
         }
-        min_q[mi_w % MQ] = mk_pkt(b, c, d) & ~0xF0u;     /* (cable 0: the host drops the cable number) */
-        min_port[mi_w++ % MQ] = PORT_USB;
+        min_push(mk_pkt(b, c, d) & ~0xF0u, PORT_USB);   /* (cable 0: the host drops the cable number) */
         uhs.in++;
         return 0;
     }
@@ -477,7 +485,8 @@ uint32_t plat_midi_ago(int port, int out)
 }
 static uint32_t midi_in_from;
 uint32_t plat_midi_in_from(void) { return midi_in_from; }
-uint32_t plat_midi_in_t24(void) { return plat_ticks24(); }   /* (the script's messages come in when they are read) */
+uint32_t plat_midi_in_t24(void) { return min_t_last; }   /* the script's time at the push: a "clock 48 21" is 21 ms apart
+                                                          * here too, where the host's own clock runs far faster */
 int plat_midi_in(uint32_t *pkt, int *port)       /* the script's "midi" (BLE-DEV's on cable 1, as radio.c has them) */
 {
     int p;
@@ -487,6 +496,7 @@ int plat_midi_in(uint32_t *pkt, int *port)       /* the script's "midi" (BLE-DEV
     p = (int)min_port[mi_r % MQ];
     if (port)
         *port = p;
+    min_t_last = min_t[mi_r % MQ];
     q = min_q[mi_r++ % MQ];
     midi_in_from = p == PORT_USB ? TO_USB : p != PORT_BLE ? 0u : (q >> 4 & 0xFu) == 1u ? TO_BLE_DEV : TO_BLE_HOST;
     *pkt = q & ~0xF0u;
@@ -2806,8 +2816,8 @@ int main(int argc, char **argv)
             if ((p < 0 || p == PORT_USB) && !dev && usbh_port()) {   /* (the port is a host: no computer to send it) */
                 printf("  midi USB: the port is a USB host, no computer: dropped\n");
             } else {
-                min_q[mi_w % MQ] = p < 0 ? mk_pkt(a, b, c) : mk_pkt(b, c, d) | (dev ? 0x10u : 0u);   /* cable 1 */
-                min_port[mi_w++ % MQ] = p < 0 ? PORT_USB : (uint32_t)p;
+                min_push(p < 0 ? mk_pkt(a, b, c) : mk_pkt(b, c, d) | (dev ? 0x10u : 0u),   /* cable 1 */
+                         p < 0 ? PORT_USB : (uint32_t)p);
             }
             run_ms(2);
         } else if (!strcmp(cmd, "usbh") && !strcmp(a, "clock")) {   /* usbh clock N [MS]: N clocks from the device */
@@ -3025,8 +3035,7 @@ int main(int argc, char **argv)
                     run_ms((uint32_t)gap);
                     continue;
                 }
-                min_port[mi_w % MQ] = PORT_USB;
-                min_q[mi_w++ % MQ] = 0x0Fu | 0xF8u << 8;
+                min_push(0x0Fu | 0xF8u << 8, PORT_USB);
                 run_ms((uint32_t)gap);
             }
 #if FM1B_MIRROR
